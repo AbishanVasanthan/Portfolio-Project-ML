@@ -1,0 +1,15 @@
+.env
+data/
+results/
+mlruns/
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+*.ipynb_checkpoints/
+*.log

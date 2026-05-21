@@ -1,0 +1,287 @@
+---
+# ============================================================
+# Tokyo Cement Demand Forecasting — Central Configuration
+# All parameters, coordinates, weights, and API references
+# live here. No magic numbers in scripts.
+# ============================================================
+
+# ── Paths ───────────────────────────────────────────────────
+paths:
+  raw_kaggle:       data/raw/kaggle
+  raw_weather:      data/raw/weather
+  raw_economic:     data/raw/economic
+  raw_calendar:     data/raw/calendar
+  interim:          data/interim
+  processed:        data/processed
+  results:          results
+
+# ── Database ─────────────────────────────────────────────────
+db:
+  schema_file:      src/db/schema.sql
+
+# ── Kaggle ───────────────────────────────────────────────────
+kaggle:
+  dataset:          kishorkhengare/cement-sales-demand
+
+# ── Weather API (Open-Meteo) ──────────────────────────────────
+weather:
+  hourly_vars:      temperature_2m,relative_humidity_2m,precipitation,rain,cloud_cover
+  timezone:         Asia/Colombo
+  era5_start:       "2010-01-01"
+  era5_end:         "2022-11-30"
+  tier2_start:      "2022-12-01"
+  tier2_lag_days:   92          # Tier 2 ends 92 days before today; Tier 3 covers the rest
+  urls:
+    era5:           "https://archive-api.open-meteo.com/v1/archive"
+    tier2:          "https://historical-forecast-api.open-meteo.com/v1/forecast"
+    current:        "https://api.open-meteo.com/v1/forecast"
+
+# ── World Bank ────────────────────────────────────────────────
+worldbank:
+  country:          LKA
+  indicators:
+    gdp:            NY.GDP.MKTP.CN
+    population:     SP.POP.TOTL
+    lending_rate:   FR.INR.LNDP
+    govt_consumption: NE.CON.GOVT.CN
+  start_year:       2010
+  end_year:         2025
+  pink_sheet_url:   "https://thedocs.worldbank.org/en/doc/5d903e848db1d1b83e0ec8f744e55570-0350012021/related/CMO-Pink-Sheet-April-2025.xlsx"
+
+# ── Augmentation parameters ───────────────────────────────────
+augmentation:
+  # Tokyo Cement implied annual volume (Rs 50.1Bn / Rs 52000/tonne)
+  tokyo_annual_tonnes:    963000
+  tokyo_monthly_tonnes:   80250
+  tokyo_market_share:     0.40
+  # 2022 crisis demand shock
+  crisis_year:            2022
+  crisis_multiplier:      0.72
+  # Weekly disaggregation weights within a month
+  weekly_weights_4:       [0.29, 0.26, 0.25, 0.20]
+  weekly_weights_5:       [0.24, 0.22, 0.21, 0.19, 0.14]
+  # Seasonal override multiplier formula: 1.15 - (precip_norm * 0.40)
+  seasonal_peak:          1.15
+  seasonal_range:         0.40
+  # Depot noise term (±%)
+  depot_noise_pct:        0.03
+  depot_noise_seed:       42
+
+# ── Feature engineering ───────────────────────────────────────
+features:
+  lag_weeks:        [1, 2, 3, 4, 6, 52]
+  rolling_windows:  [4, 12]
+  drop_cols:        [sales_tonnes, production_tonnes]
+
+# ── Model ─────────────────────────────────────────────────────
+model:
+  name:             cement_demand_forecaster
+  horizons:         [1, 2, 3, 4, 5, 6]
+  # Rolling-window cross-validation
+  cv_train_weeks:   104
+  cv_val_weeks:     6
+  cv_step_weeks:    6
+  cv_min_folds:     5
+  # Optuna tuning trials
+  optuna_trials:    50
+  # XGBoost search ranges
+  xgb:
+    n_estimators:     [200, 800]
+    max_depth:        [3, 8]
+    learning_rate:    [0.01, 0.15]
+    subsample:        [0.6, 1.0]
+    colsample_bytree: [0.6, 1.0]
+    min_child_weight: [1, 10]
+  # MLflow registry
+  registry_name:    cement_demand_forecaster
+  max_versions_kept: 3
+  retrain_batch_size: 5       # retrain after this many new sales_actuals rows
+
+# ── API ──────────────────────────────────────────────────────
+api:
+  host:             "0.0.0.0"
+  port:             8000
+
+# ── Alerts ───────────────────────────────────────────────────
+alerts:
+  low_stock_critical_weeks:   2
+  low_stock_critical_buffer:  0.80
+  low_stock_warning_weeks:    4
+  low_stock_warning_buffer:   0.90
+  demand_spike_multiplier:    1.30
+  overstock_multiplier:       1.50
+  overstock_weeks:            6
+
+# ── Purchase Orders ──────────────────────────────────────────
+purchase_orders:
+  safety_stock_pct:   0.25
+
+# ── Depots ───────────────────────────────────────────────────
+depots:
+  - name:         Colombo
+    district:     Western
+    province:     Western
+    lat:          6.9271
+    lon:          79.8612
+    pop_weight:   0.121
+
+  - name:         Kelaniya
+    district:     Western
+    province:     Western
+    lat:          6.9552
+    lon:          79.9201
+    pop_weight:   0.089
+
+  - name:         Panadura
+    district:     Western
+    province:     Western
+    lat:          6.7131
+    lon:          79.9042
+    pop_weight:   0.061
+
+  - name:         Gampaha
+    district:     Western
+    province:     Western
+    lat:          7.0917
+    lon:          79.9997
+    pop_weight:   0.058
+
+  - name:         Kandy
+    district:     Central
+    province:     Central
+    lat:          7.2906
+    lon:          80.6337
+    pop_weight:   0.062
+
+  - name:         Matale
+    district:     Central
+    province:     Central
+    lat:          7.4675
+    lon:          80.6234
+    pop_weight:   0.028
+
+  - name:         Nuwara Eliya
+    district:     Central
+    province:     Central
+    lat:          6.9497
+    lon:          80.7891
+    pop_weight:   0.033
+
+  - name:         Galle
+    district:     Southern
+    province:     Southern
+    lat:          6.0535
+    lon:          80.2210
+    pop_weight:   0.048
+
+  - name:         Matara
+    district:     Southern
+    province:     Southern
+    lat:          5.9549
+    lon:          80.5550
+    pop_weight:   0.041
+
+  - name:         Hambantota
+    district:     Southern
+    province:     Southern
+    lat:          6.1241
+    lon:          81.1185
+    pop_weight:   0.025
+
+  - name:         Jaffna
+    district:     Northern
+    province:     Northern
+    lat:          9.6615
+    lon:          80.0255
+    pop_weight:   0.031
+
+  - name:         Vavuniya
+    district:     Northern
+    province:     Northern
+    lat:          8.7514
+    lon:          80.4971
+    pop_weight:   0.014
+
+  - name:         Mannar
+    district:     Northern
+    province:     Northern
+    lat:          8.9810
+    lon:          79.9044
+    pop_weight:   0.009
+
+  - name:         Trincomalee
+    district:     Eastern
+    province:     Eastern
+    lat:          8.5874
+    lon:          81.2152
+    pop_weight:   0.027
+
+  - name:         Batticaloa
+    district:     Eastern
+    province:     Eastern
+    lat:          7.7102
+    lon:          81.6924
+    pop_weight:   0.031
+
+  - name:         Ampara
+    district:     Eastern
+    province:     Eastern
+    lat:          7.2913
+    lon:          81.6722
+    pop_weight:   0.030
+
+  - name:         Kurunegala
+    district:     North Western
+    province:     North Western
+    lat:          7.4818
+    lon:          80.3609
+    pop_weight:   0.063
+
+  - name:         Puttalam
+    district:     North Western
+    province:     North Western
+    lat:          8.0362
+    lon:          79.8283
+    pop_weight:   0.036
+
+  - name:         Anuradhapura
+    district:     North Central
+    province:     North Central
+    lat:          8.3114
+    lon:          80.4037
+    pop_weight:   0.036
+
+  - name:         Polonnaruwa
+    district:     North Central
+    province:     North Central
+    lat:          7.9403
+    lon:          81.0188
+    pop_weight:   0.019
+
+  - name:         Ratnapura
+    district:     Sabaragamuwa
+    province:     Sabaragamuwa
+    lat:          6.6828
+    lon:          80.3992
+    pop_weight:   0.045
+
+  - name:         Kegalle
+    district:     Sabaragamuwa
+    province:     Sabaragamuwa
+    lat:          7.2513
+    lon:          80.3464
+    pop_weight:   0.038
+
+  - name:         Badulla
+    district:     Uva
+    province:     Uva
+    lat:          6.9934
+    lon:          81.0550
+    pop_weight:   0.034
+
+  - name:         Monaragala
+    district:     Uva
+    province:     Uva
+    lat:          6.8728
+    lon:          81.3507
+    pop_weight:   0.021
