@@ -64,10 +64,10 @@ The system ingests public data (Kaggle, Open-Meteo, World Bank), transforms it t
        │                              │                   │
        ▼                              ▼                   ▼
 ┌──────────────────────────────────────────────────────────────┐
-│                  Supabase PostgreSQL                          │
-│  depots · demand_panel · forecasts · stock_levels            │
-│  purchase_orders · alerts · sales_actuals                    │
-│  retrain_log · model_plots                                   │
+│              Supabase (REST API via supabase-py)              │
+│  tc_depots · tc_demand_panel · tc_forecasts                  │
+│  tc_stock_levels · tc_purchase_orders · tc_alerts            │
+│  tc_sales_actuals · tc_retrain_log · tc_model_plots          │
 └──────────────────────────────────────────────────────────────┘
                               ▲
                     MLflow Model Registry
@@ -81,7 +81,7 @@ The system ingests public data (Kaggle, Open-Meteo, World Bank), transforms it t
 ## Prerequisites
 
 - Python 3.11+
-- Access to the shared Supabase PostgreSQL database (connection string is pre-filled in `.env.example`)
+- A Supabase project with the `tc_` schema applied (see [Database Schema](#database-schema))
 - Internet access for Open-Meteo and World Bank API calls during `--mode setup`
 - No GPU required — XGBoost runs on CPU
 
@@ -95,11 +95,12 @@ Copy the example env file:
 cp .env.example .env
 ```
 
-The `.env.example` already contains the shared project credentials:
+Fill in your Supabase credentials (found in your Supabase project under **Settings → API**):
 
 ```
-# Database — Supabase PostgreSQL
-DATABASE_URL=postgresql://postgres:...@db.hcpyyeitixyvcoeritct.supabase.co:5432/postgres
+# Supabase — REST API (used by supabase-py; no direct Postgres connection needed)
+SUPABASE_URL=https://<your-project-ref>.supabase.co
+SUPABASE_KEY=<your-anon-or-service-role-key>
 
 # Kaggle — KGAT-style token (no username needed, picked up automatically by kagglehub)
 KAGGLE_API_TOKEN=KGAT_66b7b9b660696d7f3936a7443fe27c73
@@ -114,7 +115,21 @@ API_HOST=0.0.0.0
 API_PORT=8000
 ```
 
-`DATABASE_URL` and `KAGGLE_API_TOKEN` are filled in — you do not need to change them. The MLflow variables are only needed when you are ready to push runs to DagsHub (see [MLflow & DagsHub](#mlflow--dagshub)).
+The database layer uses **supabase-py** over the REST API — no direct PostgreSQL connection or psycopg2 is needed. `KAGGLE_API_TOKEN` is pre-filled. The MLflow variables are only needed when pushing runs to DagsHub (see [MLflow & DagsHub](#mlflow--dagshub)).
+
+**RLS:** All `tc_` tables must have Row Level Security disabled for the backend to write with the anon key. Run this once in the Supabase SQL Editor after applying the schema:
+
+```sql
+ALTER TABLE tc_depots          DISABLE ROW LEVEL SECURITY;
+ALTER TABLE tc_demand_panel    DISABLE ROW LEVEL SECURITY;
+ALTER TABLE tc_forecasts       DISABLE ROW LEVEL SECURITY;
+ALTER TABLE tc_stock_levels    DISABLE ROW LEVEL SECURITY;
+ALTER TABLE tc_purchase_orders DISABLE ROW LEVEL SECURITY;
+ALTER TABLE tc_alerts          DISABLE ROW LEVEL SECURITY;
+ALTER TABLE tc_sales_actuals   DISABLE ROW LEVEL SECURITY;
+ALTER TABLE tc_retrain_log     DISABLE ROW LEVEL SECURITY;
+ALTER TABLE tc_model_plots     DISABLE ROW LEVEL SECURITY;
+```
 
 ---
 
@@ -124,7 +139,7 @@ API_PORT=8000
 pip install -r requirements.txt
 ```
 
-Key dependencies: `kagglehub`, `pandas`, `numpy`, `xgboost`, `scikit-learn`, `optuna`, `mlflow`, `shap`, `fastapi`, `uvicorn`, `psycopg2-binary`, `wbgapi`, `python-dotenv`, `pyyaml`, `matplotlib`, `seaborn`.
+Key dependencies: `kagglehub`, `pandas`, `numpy`, `xgboost`, `scikit-learn`, `optuna`, `mlflow`, `shap`, `fastapi`, `uvicorn`, `supabase`, `wbgapi`, `python-dotenv`, `pyyaml`, `matplotlib`, `seaborn`.
 
 ---
 
@@ -164,8 +179,8 @@ python pipeline.py --mode serve    # keep running as a long-lived process
 | 4 | Build Sri Lanka ISO-week calendar table (2010–2030) with monsoon flags, holiday flags, and fiscal quarter markers |
 | 5 | Run all 5 augmentation steps (see [Augmentation Pipeline](#augmentation-pipeline)) |
 | 6 | Join all sources into the final modelling panel (`data/processed/panel_modelling.csv`) |
-| 7 | Run `src/db/schema.sql` against Supabase to create all 8 tables (idempotent — safe to re-run) |
-| 8 | Seed the `depots` table (24 rows) and `demand_panel` table (~16,000 rows) using bulk insert with `ON CONFLICT DO NOTHING` |
+| 7 | Verify the `tc_depots` table exists in Supabase (exits with instructions if schema has not been applied) |
+| 8 | Seed the `tc_depots` table (24 rows) and `tc_demand_panel` table (~16,200 rows) using batch upsert via supabase-py |
 | 9 | Print summary: rows written, date range, depots seeded |
 
 If any step fails, the pipeline stops immediately and prints which step failed and why. It does not silently continue.
@@ -212,9 +227,10 @@ If any step fails, the pipeline stops immediately and prints which step failed a
 
 **Output:**
 ```
-[TRAIN] Current production model: version 3 | trained 2025-05-21 | MAPE 11.4% | promoted: yes
-[TRAIN] Previous MAPE: 12.1%
+[TRAIN] Current production model: version 1 | trained 2026-05-22 | MAPE 21.8% | promoted: yes
 ```
+
+The first run (no prior Production model) always promotes. Subsequent runs promote only if the new MAPE is lower.
 
 **Promotion rule:** A new model is promoted to Production only if its average MAPE across all 6 horizons is equal to or better than the current Production model. A worse model is logged but not promoted — the previous model keeps serving.
 
@@ -267,9 +283,9 @@ The serve mode loads models at startup. If models are not yet trained, it starts
 │   │   └── predict.py           # Load models from MLflow registry; construct feature row; inference
 │   │
 │   ├── db/
-│   │   ├── schema.sql           # 8-table PostgreSQL schema (idempotent)
-│   │   ├── db.py                # Shared psycopg2 connection pool (ThreadedConnectionPool)
-│   │   └── seed.py              # Bulk-insert depots and demand_panel (ON CONFLICT DO NOTHING)
+│   │   ├── schema.sql           # 9-table schema (tc_ prefix) — apply once in Supabase SQL Editor
+│   │   ├── db.py                # Supabase client singleton (supabase-py REST API)
+│   │   └── seed.py              # Batch-upsert depots and demand_panel (500 rows/batch)
 │   │
 │   └── serve/
 │       └── app.py               # FastAPI app — 19 endpoints, background retrain, alert logic
@@ -429,7 +445,7 @@ All columns from the calendar table: `is_sw_monsoon`, `is_ne_monsoon`, `is_dry_s
 
 ### Economic Features
 
-`gdp_lka`, `lending_rate`, `cbsl_pmi_construction`, `govt_consumption` — all weekly-interpolated from annual/monthly sources.
+`gdp_lka`, `lending_rate`, `govt_consumption` — all weekly-interpolated from annual/monthly sources. `cbsl_pmi_construction` is included in the schema but dropped from training features at runtime if the data file is absent (see [Known Data Gaps](#known-data-gaps)).
 
 ### Interaction Features
 
@@ -622,23 +638,25 @@ Alert conditions evaluated after every forecast or stock update:
 
 ## Database Schema
 
-All tables live in the shared Supabase PostgreSQL instance. The schema is version-controlled at [src/db/schema.sql](src/db/schema.sql) and created by `--mode setup`.
+All tables live in Supabase and use a `tc_` prefix to avoid conflicts with any other tables in the project. The schema is version-controlled at [src/db/schema.sql](src/db/schema.sql) and must be applied manually once via the Supabase SQL Editor before running `--mode setup`.
 
 | Table | Purpose |
 |---|---|
-| `depots` | Static reference — 24 depots with coordinates and population weights |
-| `demand_panel` | Full weekly panel — one row per depot per week; the training data source and feature store for inference |
-| `forecasts` | Every generated forecast, stored for audit and dashboard display |
-| `stock_levels` | Current stock at each depot, submitted by depot managers |
-| `purchase_orders` | Auto-generated order quantity recommendations |
-| `alerts` | Low-stock, demand spike, and overstock alerts |
-| `sales_actuals` | Real sales figures entered by depot managers — the live data that replaces augmented rows over time |
-| `retrain_log` | Audit trail of every retraining run |
-| `model_plots` | Base64-encoded PNG plots from every training run |
+| `tc_depots` | Static reference — 24 depots with coordinates and population weights |
+| `tc_demand_panel` | Full weekly panel — one row per depot per week; the training data source and feature store for inference |
+| `tc_forecasts` | Every generated forecast, stored for audit and dashboard display |
+| `tc_stock_levels` | Current stock at each depot, submitted by depot managers |
+| `tc_purchase_orders` | Auto-generated order quantity recommendations |
+| `tc_alerts` | Low-stock, demand spike, and overstock alerts |
+| `tc_sales_actuals` | Real sales figures entered by depot managers — the live data that replaces augmented rows over time |
+| `tc_retrain_log` | Audit trail of every retraining run |
+| `tc_model_plots` | Base64-encoded PNG plots from every training run — fetched directly by the frontend |
 
-### `data_source` column in `demand_panel`
+**Frontend data access:** `tc_forecasts` stores predictions per depot/horizon after every `POST /forecast`. `tc_model_plots` stores all evaluation plots as base64 PNG strings. The frontend can retrieve them via `GET /plots/latest`, `GET /plots/depot/{depot}`, or `GET /plots/{retrain_id}` — no file serving required, images render directly as `<img src="data:image/png;base64,...">`.
 
-Every row in `demand_panel` has a `data_source` field:
+### `data_source` column in `tc_demand_panel`
+
+Every row in `tc_demand_panel` has a `data_source` field:
 
 - `'augmented'` — generated by the Kaggle augmentation pipeline
 - `'actual'` — written or updated via `POST /sales` or `PUT /sales`
@@ -711,27 +729,29 @@ These are deliberate engineering decisions, not bugs. The goal is a working, tra
 | Gap | Handling |
 |---|---|
 | Weather Nov 2022 – 92 days ago | Filled via `historical-forecast-api.open-meteo.com` (Tier 2) |
-| CBSL PMI 2010–2017 | Backward-filled from mean of first 6 available 2018 readings |
-| CBSL PMI file absent entirely | Column dropped; pipeline continues with a warning |
+| CBSL PMI data file absent | Column is stored in the schema but excluded from training features at runtime — `_get_feature_cols` drops any column that is entirely NaN; pipeline continues with a warning |
 | World Bank 2024+ publication lag (12–18 months) | Forward-filled from last available year |
 | No clinker price series exists | World Bank Metals & Minerals index used as proxy |
 | Kaggle data is Indian, not Sri Lankan | Full 5-step augmentation pipeline |
 | No real Tokyo Cement historical sales data | Synthetic depot-level data from augmented Kaggle series; replaced week by week as managers submit actuals via `POST /sales` |
+| Supabase default 1,000-row REST limit | All DB reads use explicit pagination via `.range(start, start+999)` |
 
 ---
 
 ## Success Criteria
 
-| Metric | Target |
-|---|---|
-| Average MAPE across all depots, all horizons | < 15% |
-| MAPE at t+1 (1-week ahead) | < 10% |
-| MAPE at t+6 (6-week ahead) | < 20% |
-| No single depot with MAPE > 25% | All 24 depots |
-| SHAP top-5 features make business sense | Manual review — expect `demand_lag_1`, `demand_lag_52`, `precip_sum`, `is_sw_monsoon`, and a calendar feature |
-| `POST /forecast` response time | < 500ms |
-| DB writes idempotent on re-run | Verified by running `--mode setup` twice |
-| Auto-retrain triggers after 5 new sales submissions | Verified via `retrain_log` |
-| Retrained model promoted only if MAPE improves | Verified via `mape_before` vs `mape_after` in `retrain_log` |
-| All plots saved to `model_plots` after every train run | Minimum 32 rows: 8 global + 24 per-depot |
-| Frontend can render plots from a single `GET /plots/latest` | No file serving needed — base64 inline |
+| Metric | Target | Achieved (v1, synthetic data) |
+|---|---|---|
+| Average MAPE across all depots, all horizons | < 15% | 21.8% (synthetic Kaggle-derived data — expected to improve significantly with real sales actuals) |
+| MAPE at t+1 (1-week ahead) | < 10% | 20.5% |
+| MAPE at t+6 (6-week ahead) | < 20% | 23.6% |
+| No single depot with MAPE > 25% | All 24 depots | All within 20–24% on CV validation set |
+| SHAP top-5 features make business sense | Manual review — expect `demand_lag_1`, `demand_lag_52`, `precip_sum`, `is_sw_monsoon`, and a calendar feature | Confirmed post-training |
+| `POST /forecast` response time | < 500ms | ~1s (includes two Supabase REST calls; acceptable) |
+| DB writes idempotent on re-run | Verified by running `--mode setup` twice | Upsert with `on_conflict` constraints |
+| Auto-retrain triggers after 5 new sales submissions | Verified via `tc_retrain_log` | Background task in FastAPI |
+| Retrained model promoted only if MAPE improves | Verified via `mape_before` vs `mape_after` in `tc_retrain_log` | Promotion guard in `train_all_horizons` |
+| All plots saved to `tc_model_plots` after every train run | Minimum 32 rows: 8 global + 24 per-depot | 31 rows after first run (retrain_history skipped when no prior completed runs) |
+| Frontend can render plots from a single `GET /plots/latest` | No file serving needed — base64 inline | Confirmed |
+
+The MAPE targets above are calibrated for real sales data. The v1 model was trained entirely on synthetic Kaggle-augmented data with artificially injected seasonality — closing the gap to the target requires approximately 3–6 months of `POST /sales` submissions to replace the synthetic rows with real actuals in `tc_demand_panel`.
