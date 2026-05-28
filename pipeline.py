@@ -139,108 +139,206 @@ def run_setup(cfg: dict) -> None:
 # ════════════════════════════════════════════════════════════
 
 def run_update(cfg: dict) -> None:
+    """
+    Fetch fresh weather from the API and update tc_demand_panel directly.
+
+    Two passes per depot:
+      Pass 1 — rows with NULL weather (any date): fetch the appropriate tier
+               based on the week date and UPDATE those rows in-place.
+      Pass 2 — weeks beyond the current DB ceiling: INSERT new rows with
+               weather + calendar + economics already populated.
+
+    No intermediate CSV files are used for the update path.
+    """
     logger.info("[PIPELINE] ══ MODE: update ══")
 
+    import time
     import pandas as pd
+    from datetime import date, timedelta
     from src.db.db import get_client
+    from src.ingestion.weather_ingest import _fetch_open_meteo, _agg_hourly_to_weekly
+    from src.ingestion.economic_ingest import fetch_worldbank
+    from src.ingestion.calendar_build import build_calendar
 
-    # Step 1: Find latest week in tc_demand_panel
-    logger.info("[PIPELINE] Step 1/5 — Query latest week in tc_demand_panel")
     sb = get_client()
+    lag_days = int(cfg["weather"]["tier2_lag_days"])
+    today = date.today()
+    tier2_end = today - timedelta(days=lag_days)
+
+    # ── Step 1: Latest week and depot map ────────────────────────
+    logger.info("[PIPELINE] Step 1/4 — Query DB state")
     result = sb.table("tc_demand_panel").select("week_start").order(
         "week_start", desc=True
     ).limit(1).execute()
-    latest_week = result.data[0]["week_start"] if result.data else None
-
+    latest_week = pd.Timestamp(result.data[0]["week_start"]) if result.data else None
     if not latest_week:
         logger.error("[PIPELINE] tc_demand_panel is empty. Run --mode setup first.")
         sys.exit(1)
-    logger.info("[PIPELINE] Latest week in DB: %s", latest_week)
+    logger.info("[PIPELINE] Latest week in DB: %s", latest_week.date())
 
-    # Step 2: Pull Tier 3 weather for all depots (current rolling window)
-    logger.info("[PIPELINE] Step 2/5 — Pull fresh weather data (Tier 3 only)")
-    from src.ingestion.weather_ingest import fetch_all_depots_weather
-    fetch_all_depots_weather(cfg, tier="tier3")
+    depot_result = sb.table("tc_depots").select("name,depot_id").execute()
+    depot_id_map = {r["name"]: r["depot_id"] for r in depot_result.data}
 
-    # Step 3: Pull any new World Bank data
-    logger.info("[PIPELINE] Step 3/5 — Pull updated World Bank economic data")
-    from src.ingestion.economic_ingest import fetch_worldbank
+    # ── Step 2: Refresh economics + calendar ────────────────────
+    logger.info("[PIPELINE] Step 2/4 — Refresh World Bank economics")
     econ_path = os.path.join(cfg["paths"]["raw_economic"], "worldbank_lka.csv")
     if os.path.exists(econ_path):
         os.remove(econ_path)
-    fetch_worldbank(cfg)
+    econ = fetch_worldbank(cfg)
 
-    # Step 4: Append new rows to tc_demand_panel
-    logger.info("[PIPELINE] Step 4/5 — Append new weekly rows to tc_demand_panel")
-    new_weeks_added = 0
-    try:
-        from src.ingestion.calendar_build import build_calendar
-        cal = build_calendar(cfg)
-        econ = pd.read_csv(econ_path, parse_dates=["week_start"])
+    cal = build_calendar(cfg)
 
-        weather_dir = cfg["paths"]["raw_weather"]
-        first_depot = cfg["depots"][0]
-        fname = first_depot["name"].lower().replace(" ", "_") + ".csv"
-        w_df = pd.read_csv(os.path.join(weather_dir, fname), parse_dates=["week_start"])
-        new_weather_weeks = w_df[w_df["week_start"] > pd.Timestamp(latest_week)]["week_start"]
+    weather_cols = ["precip_sum", "rain_sum", "temp_mean", "humidity_mean", "cloud_cover_mean"]
+    cal_cols = ["is_sw_monsoon", "is_ne_monsoon", "is_dry_season",
+                "is_sinhala_tamil_new_year", "is_vesak", "is_christmas_week",
+                "post_holiday_lag_1", "post_holiday_lag_2", "is_year_end_quarter",
+                "week_of_year", "month"]
+    econ_cols = ["gdp_lka", "lending_rate", "govt_consumption"]
 
-        depot_result = sb.table("tc_depots").select("name,depot_id").execute()
-        depot_map = {r["name"]: r["depot_id"] for r in depot_result.data}
+    # ── Step 3: Per-depot weather fetch + DB update ──────────────
+    logger.info("[PIPELINE] Step 3/4 — Fetch weather from API and update DB rows")
+    total_updated = 0
+    total_inserted = 0
 
-        new_rows = []
-        for new_week in sorted(new_weather_weeks):
-            cal_row = cal[cal["week_start"] == new_week]
-            econ_row = econ[econ["week_start"] == new_week]
+    for depot in cfg["depots"]:
+        name = depot["name"]
+        depot_id = depot_id_map.get(name)
+        if not depot_id:
+            continue
 
-            for depot in cfg["depots"]:
-                depot_id = depot_map.get(depot["name"])
-                if not depot_id:
-                    continue
+        logger.info("[PIPELINE] Processing depot: %s", name)
 
-                wf = os.path.join(weather_dir, depot["name"].lower().replace(" ", "_") + ".csv")
-                w_df2 = pd.read_csv(wf, parse_dates=["week_start"])
-                week_weather = w_df2[w_df2["week_start"] == new_week]
+        # Find weeks for this depot that need weather (NULL precip_sum)
+        null_result = sb.table("tc_demand_panel").select("week_start").eq(
+            "depot_id", depot_id
+        ).is_("precip_sum", "null").order("week_start").execute()
+        null_weeks = [pd.Timestamp(r["week_start"]) for r in null_result.data]
 
-                row = {
+        if not null_weeks:
+            logger.info("[PIPELINE] %s — no NULL weather rows, checking for new weeks only", name)
+
+        # Determine full date range to fetch: earliest null week to today
+        fetch_start = null_weeks[0].date() if null_weeks else (latest_week + pd.Timedelta(weeks=1)).date()
+        fetch_start = min(fetch_start, (latest_week + pd.Timedelta(weeks=1)).date())
+
+        try:
+            base = {
+                "latitude": depot["lat"],
+                "longitude": depot["lon"],
+                "hourly": cfg["weather"]["hourly_vars"],
+                "timezone": cfg["weather"]["timezone"],
+                "format": "csv",
+            }
+            frames = []
+
+            # Tier 2: historical forecast archive for dates before the rolling window
+            if pd.Timestamp(fetch_start) < pd.Timestamp(tier2_end):
+                p2 = {**base, "start_date": fetch_start.isoformat(),
+                      "end_date": tier2_end.isoformat()}
+                try:
+                    df2 = _fetch_open_meteo(cfg["weather"]["urls"]["tier2"], p2)
+                    frames.append(_agg_hourly_to_weekly(df2))
+                    logger.info("[PIPELINE] %s — Tier2 fetched (%s → %s)",
+                                name, fetch_start, tier2_end)
+                except Exception as e:
+                    logger.warning("[PIPELINE] %s — Tier2 failed (non-fatal): %s", name, e)
+
+            # Tier 3: current rolling window
+            p3 = {**base, "past_days": lag_days, "forecast_days": 0}
+            try:
+                df3 = _fetch_open_meteo(cfg["weather"]["urls"]["current"], p3)
+                frames.append(_agg_hourly_to_weekly(df3))
+                logger.info("[PIPELINE] %s — Tier3 fetched", name)
+            except Exception as e:
+                logger.warning("[PIPELINE] %s — Tier3 failed (non-fatal): %s", name, e)
+
+            if not frames:
+                logger.warning("[PIPELINE] %s — no weather data fetched, skipping", name)
+                time.sleep(3)
+                continue
+
+            weather_df = (
+                pd.concat(frames, ignore_index=True)
+                .drop_duplicates(subset=["week_start"])
+                .sort_values("week_start")
+                .reset_index(drop=True)
+            )
+            weather_df = weather_df[weather_df["week_start"] >= pd.Timestamp(fetch_start)]
+
+        except Exception as e:
+            logger.error("[PIPELINE] %s — weather fetch failed: %s", name, e)
+            time.sleep(3)
+            continue
+
+        # Build update/insert records
+        null_week_set = {w.date().isoformat() for w in null_weeks}
+        cutoff = latest_week.date().isoformat()
+
+        updates = []
+        inserts = []
+
+        for _, wrow in weather_df.iterrows():
+            week_str = wrow["week_start"].strftime("%Y-%m-%d")
+            w_vals = {}
+            for col in weather_cols:
+                v = wrow.get(col)
+                w_vals[col] = float(v) if pd.notna(v) else None
+
+            if week_str in null_week_set:
+                # Existing row with NULL weather — UPDATE only weather cols
+                updates.append({"week_start": week_str, **w_vals})
+
+            elif week_str > cutoff:
+                # New week beyond DB ceiling — INSERT with all context
+                cal_row = cal[cal["week_start"] == wrow["week_start"]]
+                econ_row = econ[econ["week_start"] == wrow["week_start"]]
+                rec = {
                     "depot_id": depot_id,
-                    "week_start": new_week.date().isoformat(),
+                    "week_start": week_str,
                     "data_source": "augmented",
+                    **w_vals,
                 }
-                if not week_weather.empty:
-                    for col in ["precip_sum", "rain_sum", "temp_mean", "humidity_mean", "cloud_cover_mean"]:
-                        if col in week_weather.columns:
-                            row[col] = float(week_weather[col].iloc[0])
                 if not cal_row.empty:
-                    for col in ["is_sw_monsoon", "is_ne_monsoon", "is_dry_season",
-                                "is_sinhala_tamil_new_year", "is_vesak", "is_christmas_week",
-                                "post_holiday_lag_1", "post_holiday_lag_2", "is_year_end_quarter"]:
+                    for col in cal_cols:
                         if col in cal_row.columns:
-                            row[col] = int(cal_row[col].iloc[0])
+                            v = cal_row[col].iloc[0]
+                            rec[col] = int(v) if col not in ("week_of_year", "month") else int(v)
                 if not econ_row.empty:
-                    for col in ["gdp_lka", "lending_rate", "govt_consumption"]:
+                    for col in econ_cols:
                         if col in econ_row.columns:
-                            row[col] = float(econ_row[col].iloc[0])
-                new_rows.append(row)
+                            v = econ_row[col].iloc[0]
+                            rec[col] = float(v) if pd.notna(v) else None
+                inserts.append(rec)
 
-        if new_rows:
+        # Apply updates (PATCH weather into existing rows)
+        for rec in updates:
+            sb.table("tc_demand_panel").update(
+                {k: v for k, v in rec.items() if k != "week_start"}
+            ).eq("depot_id", depot_id).eq("week_start", rec["week_start"]).execute()
+        total_updated += len(updates)
+
+        # Apply inserts (new weeks)
+        if inserts:
             batch_size = 200
-            for i in range(0, len(new_rows), batch_size):
+            for i in range(0, len(inserts), batch_size):
                 sb.table("tc_demand_panel").upsert(
-                    new_rows[i : i + batch_size],
+                    inserts[i: i + batch_size],
                     on_conflict="depot_id,week_start",
                 ).execute()
-            new_weeks_added = len(set(r["week_start"] for r in new_rows))
+            total_inserted += len(inserts)
 
-    except Exception as e:
-        logger.error("[PIPELINE] update step 4 failed: %s", e)
-        raise
+        logger.info("[PIPELINE] %s — %d weather rows updated, %d new rows inserted",
+                    name, len(updates), len(inserts))
+        time.sleep(3)  # respect Open-Meteo rate limit (3 req/s free tier)
 
-    # Step 5: Summary
+    # ── Step 4: Summary ──────────────────────────────────────────
     logger.info(
         "[PIPELINE] ✓ Update complete\n"
-        "  Weeks added:   %d\n"
-        "  Depots updated: %d",
-        new_weeks_added,
+        "  Weather rows updated: %d\n"
+        "  New weeks inserted:   %d\n"
+        "  Depots processed:     %d",
+        total_updated,
+        total_inserted,
         len(cfg["depots"]),
     )
 
