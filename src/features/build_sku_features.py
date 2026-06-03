@@ -26,7 +26,7 @@ SHARED_COLS = [
     "is_sw_monsoon", "is_ne_monsoon", "is_dry_season",
     "is_sinhala_tamil_new_year", "is_vesak", "is_christmas_week",
     "post_holiday_lag_1", "post_holiday_lag_2", "is_year_end_quarter",
-    "week_of_year", "month",
+    # week_of_year and month are derived from week_start below — not stored in DB
 ]
 
 
