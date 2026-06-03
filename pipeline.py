@@ -469,6 +469,118 @@ def run_forecast_all(cfg: dict) -> None:
 
 
 # ════════════════════════════════════════════════════════════
+# MODE: setup_skus
+# ════════════════════════════════════════════════════════════
+
+def run_setup_skus(cfg: dict) -> None:
+    """Seed tc_skus + generate synthetic tc_sku_demand_panel from tc_demand_panel."""
+    logger.info("[PIPELINE] ══ MODE: setup_skus ══")
+    logger.info("[PIPELINE] Step 1/2 — Verify tc_skus table exists")
+
+    from src.db.db import get_client
+    sb = get_client()
+    try:
+        sb.table("tc_skus").select("sku_id").limit(1).execute()
+    except Exception:
+        logger.error(
+            "[PIPELINE] tc_skus table not found.\n"
+            "  → Run src/db/sku_schema.sql in the Supabase SQL Editor first."
+        )
+        import sys; sys.exit(1)
+
+    logger.info("[PIPELINE] Step 2/2 — Seed SKU demand panel")
+    from src.db.seed_skus import seed_sku_demand_panel
+    rows = seed_sku_demand_panel(seed=42)
+    logger.info("[PIPELINE] ✓ setup_skus complete — %d rows written", rows)
+
+
+# ════════════════════════════════════════════════════════════
+# MODE: train_sku
+# ════════════════════════════════════════════════════════════
+
+def run_train_sku(cfg: dict) -> None:
+    """Train 6 XGBoost SKU models and push forecasts for all depot × SKU combinations."""
+    logger.info("[PIPELINE] ══ MODE: train_sku ══")
+
+    from src.db.db import get_client
+    from src.model.train_sku import train_sku_horizons
+
+    sb = get_client()
+    log_row = sb.table("tc_retrain_log").insert({
+        "triggered_by": "pipeline_cli",
+        "trigger_reason": "--mode train_sku",
+        "status": "running",
+    }).execute()
+    retrain_id = log_row.data[0]["id"]
+
+    logger.info("[PIPELINE] Step 1/3 — Train SKU horizon models")
+    result = train_sku_horizons(cfg, retrain_id=retrain_id)
+
+    logger.info("[PIPELINE] Step 2/3 — Update retrain log")
+    sb.table("tc_retrain_log").update({
+        "status": "completed",
+        "mape_after": result["overall_mape"],
+        "promoted": result["promoted"],
+    }).eq("id", retrain_id).execute()
+
+    logger.info("[PIPELINE] Step 3/3 — Push SKU forecasts for all depots")
+    run_forecast_sku_all(cfg)
+
+    print(
+        f"\n[TRAIN_SKU] Overall MAPE: {result['overall_mape']:.1f}% | "
+        f"promoted: {'yes' if result['promoted'] else 'no'}"
+    )
+    for h, mape in result["horizon_mapes"].items():
+        print(f"  h{h}: {mape:.1f}%")
+
+
+# ════════════════════════════════════════════════════════════
+# MODE: forecast_sku_all
+# ════════════════════════════════════════════════════════════
+
+def run_forecast_sku_all(cfg: dict) -> None:
+    """Generate 6-week × 6-SKU forecasts for every depot → tc_sku_forecasts."""
+    import pandas as pd
+    from datetime import date
+    from src.db.db import get_client
+    from src.model.predict_sku import load_sku_models, forecast_sku_depot
+
+    logger.info("[PIPELINE] ══ MODE: forecast_sku_all ══")
+    load_sku_models(cfg)
+
+    sb = get_client()
+    depot_result = sb.table("tc_depots").select("depot_id,name").order("name").execute()
+    depots = depot_result.data
+    today  = date.today()
+    total  = 0
+
+    for depot in depots:
+        depot_id   = depot["depot_id"]
+        depot_name = depot["name"]
+        try:
+            forecasts = forecast_sku_depot(depot_name, depot_id, today, cfg)
+        except Exception as e:
+            logger.warning("[PIPELINE] forecast_sku_all: depot '%s' failed: %s", depot_name, e)
+            continue
+
+        for fc in forecasts:
+            sb.table("tc_sku_forecasts").upsert({
+                "depot_id":       depot_id,
+                "sku_id":         fc["sku_id"],
+                "as_of_date":     today.isoformat(),
+                "horizon_weeks":  fc["horizon"],
+                "forecast_week":  fc["forecast_week"].isoformat(),
+                "demand_forecast": fc["demand_tonnes"],
+            }, on_conflict="depot_id,sku_id,forecast_week").execute()
+
+        total += 1
+        logger.info("[PIPELINE] forecast_sku_all: %s — %d forecasts stored",
+                    depot_name, len(forecasts))
+
+    logger.info("[PIPELINE] ✓ forecast_sku_all complete: %d/%d depots", total, len(depots))
+
+
+# ════════════════════════════════════════════════════════════
 # MODE: serve
 # ════════════════════════════════════════════════════════════
 
@@ -518,7 +630,9 @@ def main():
     parser.add_argument(
         "--mode",
         required=True,
-        choices=["setup", "update", "train", "forecast_all", "serve"],
+        choices=["setup", "update", "train", "forecast_all",
+                 "setup_skus", "train_sku", "forecast_sku_all",
+                 "serve"],
         help="Pipeline mode to run",
     )
     args = parser.parse_args()
@@ -535,11 +649,14 @@ def main():
             os.makedirs(path, exist_ok=True)
 
     mode_fns = {
-        "setup": run_setup,
-        "update": run_update,
-        "train": run_train,
-        "forecast_all": run_forecast_all,
-        "serve": run_serve,
+        "setup":            run_setup,
+        "update":           run_update,
+        "train":            run_train,
+        "forecast_all":     run_forecast_all,
+        "setup_skus":       run_setup_skus,
+        "train_sku":        run_train_sku,
+        "forecast_sku_all": run_forecast_sku_all,
+        "serve":            run_serve,
     }
 
     try:

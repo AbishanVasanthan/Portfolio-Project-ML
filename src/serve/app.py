@@ -717,3 +717,164 @@ def _run_retrain(retrain_id: int) -> None:
             "status": "failed",
             "error_message": str(e),
         }).eq("id", retrain_id).execute()
+
+
+# ════════════════════════════════════════════════════════════
+# SKU FORECAST ENDPOINTS
+# ════════════════════════════════════════════════════════════
+
+_sku_models_loaded = False
+
+
+@app.on_event("startup")
+async def _load_sku_models():
+    global _sku_models_loaded
+    from src.model.predict_sku import load_sku_models
+    try:
+        load_sku_models(_cfg)
+        _sku_models_loaded = True
+        logger.info("[SERVE] SKU models loaded successfully")
+    except Exception as e:
+        logger.warning("[SERVE] SKU models not loaded (run --mode train_sku first): %s", e)
+
+
+# ── GET /skus ─────────────────────────────────────────────────
+
+@app.get("/skus")
+def get_skus():
+    """List all 6 Tokyo Cement products."""
+    sb = get_client()
+    result = sb.table("tc_skus").select(
+        "sku_id,sku_code,name,mix_ratio"
+    ).order("sku_code").execute()
+    return result.data
+
+
+# ── GET /forecast/sku/{depot}/{sku_code} ──────────────────────
+
+@app.get("/forecast/sku/{depot}/{sku_code}")
+def get_sku_forecast(depot: str, sku_code: str):
+    """Latest 6-week forecast for one product at one depot."""
+    depot_id, depot_name = _resolve_depot(depot)
+    sb = get_client()
+
+    sku_res = sb.table("tc_skus").select("sku_id,name").eq(
+        "sku_code", sku_code.upper()
+    ).maybe_single().execute()
+    if not sku_res.data:
+        raise HTTPException(status_code=404, detail=f"SKU '{sku_code}' not found")
+    sku_id   = sku_res.data["sku_id"]
+    sku_name = sku_res.data["name"]
+
+    latest_date_res = sb.table("tc_sku_forecasts").select("as_of_date").eq(
+        "depot_id", depot_id
+    ).eq("sku_id", sku_id).order("as_of_date", desc=True).limit(1).execute()
+    if not latest_date_res.data:
+        raise HTTPException(status_code=404, detail="No forecasts found — run --mode train_sku first")
+    latest_date = latest_date_res.data[0]["as_of_date"]
+
+    rows = sb.table("tc_sku_forecasts").select(
+        "horizon_weeks,forecast_week,demand_forecast,model_version,generated_at"
+    ).eq("depot_id", depot_id).eq("sku_id", sku_id).eq(
+        "as_of_date", latest_date
+    ).order("horizon_weeks").execute()
+
+    return {
+        "depot":     depot_name,
+        "sku_code":  sku_code.upper(),
+        "sku_name":  sku_name,
+        "as_of_date": latest_date,
+        "forecasts": [
+            {
+                "horizon":        r["horizon_weeks"],
+                "forecast_week":  r["forecast_week"],
+                "demand_tonnes":  r["demand_forecast"],
+                "model_version":  r["model_version"],
+            }
+            for r in rows.data
+        ],
+    }
+
+
+# ── GET /forecast/sku-summary/{depot} ────────────────────────
+
+@app.get("/forecast/sku-summary/{depot}")
+def get_sku_summary(depot: str):
+    """All 6 products × 6 horizons for one depot in a single call."""
+    depot_id, depot_name = _resolve_depot(depot)
+    sb = get_client()
+
+    latest_date_res = sb.table("tc_sku_forecasts").select("as_of_date").eq(
+        "depot_id", depot_id
+    ).order("as_of_date", desc=True).limit(1).execute()
+    if not latest_date_res.data:
+        raise HTTPException(status_code=404, detail="No SKU forecasts found — run --mode train_sku first")
+    latest_date = latest_date_res.data[0]["as_of_date"]
+
+    rows = sb.table("tc_sku_forecasts").select(
+        "sku_id,horizon_weeks,forecast_week,demand_forecast"
+    ).eq("depot_id", depot_id).eq("as_of_date", latest_date).execute()
+
+    skus = sb.table("tc_skus").select("sku_id,sku_code,name").execute()
+    sku_info = {s["sku_id"]: s for s in skus.data}
+
+    summary: dict = {}
+    for r in rows.data:
+        sid  = r["sku_id"]
+        code = sku_info.get(sid, {}).get("sku_code", str(sid))
+        if code not in summary:
+            summary[code] = {
+                "sku_name":  sku_info.get(sid, {}).get("name", code),
+                "forecasts": [],
+            }
+        summary[code]["forecasts"].append({
+            "horizon":       r["horizon_weeks"],
+            "forecast_week": r["forecast_week"],
+            "demand_tonnes": r["demand_forecast"],
+        })
+
+    for v in summary.values():
+        v["forecasts"].sort(key=lambda x: x["horizon"])
+
+    return {"depot": depot_name, "as_of_date": latest_date, "skus": summary}
+
+
+# ── POST /forecast/sku/all ────────────────────────────────────
+
+@app.post("/forecast/sku/all")
+def trigger_sku_forecast_all(
+    background_tasks: BackgroundTasks,
+    x_admin_key: Optional[str] = Header(None),
+):
+    """Regenerate SKU forecasts for all depots (admin-protected)."""
+    expected = os.environ.get("ADMIN_API_KEY")
+    if expected and x_admin_key != expected:
+        raise HTTPException(status_code=401, detail="Invalid admin key")
+    if not _sku_models_loaded:
+        raise HTTPException(status_code=503, detail="SKU models not loaded. Run --mode train_sku first.")
+    background_tasks.add_task(_run_sku_forecast_all)
+    return {"status": "started", "message": "SKU forecast generation running in background"}
+
+
+def _run_sku_forecast_all() -> None:
+    from datetime import date
+    from src.model.predict_sku import forecast_sku_depot
+    sb = get_client()
+    today = date.today()
+    depot_result = sb.table("tc_depots").select("depot_id,name").order("name").execute()
+    for depot in depot_result.data:
+        depot_id, depot_name = depot["depot_id"], depot["name"]
+        try:
+            forecasts = forecast_sku_depot(depot_name, depot_id, today, _cfg)
+            for fc in forecasts:
+                sb.table("tc_sku_forecasts").upsert({
+                    "depot_id":       depot_id,
+                    "sku_id":         fc["sku_id"],
+                    "as_of_date":     today.isoformat(),
+                    "horizon_weeks":  fc["horizon"],
+                    "forecast_week":  fc["forecast_week"].isoformat(),
+                    "demand_forecast": fc["demand_tonnes"],
+                }, on_conflict="depot_id,sku_id,forecast_week").execute()
+            logger.info("[SERVE] sku_forecast_all: %s done", depot_name)
+        except Exception as e:
+            logger.warning("[SERVE] sku_forecast_all: %s failed: %s", depot_name, e)
