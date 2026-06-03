@@ -9,26 +9,49 @@ string the dashboard backend already uses).
 """
 import logging
 import os
+import threading
 from decimal import Decimal
 from typing import Any
 
 import psycopg
 from psycopg.rows import dict_row
 
+logger = logging.getLogger(__name__)
+
 
 def _coerce(row: dict) -> dict:
     """Convert Decimal → float so pandas arithmetic works without surprises."""
     return {k: float(v) if isinstance(v, Decimal) else v for k, v in row.items()}
 
-logger = logging.getLogger(__name__)
-
 
 def _db_url() -> str:
     url = os.environ["DATABASE_URL"]
-    # Normalise SQLAlchemy driver prefix → plain postgresql://
     return url.replace("postgresql+psycopg://", "postgresql://").replace(
         "postgres+psycopg://", "postgresql://"
     )
+
+
+# ── Thread-local persistent connection ────────────────────────
+# Reuses one connection per thread — avoids exhausting Windows
+# socket quota when hundreds of queries fire in rapid succession.
+
+_local = threading.local()
+
+
+def _get_conn() -> psycopg.Connection:
+    conn = getattr(_local, "conn", None)
+    if conn is not None and not conn.closed:
+        try:
+            conn.execute("SELECT 1")
+            return conn
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    _local.conn = psycopg.connect(_db_url(), row_factory=dict_row)
+    logger.debug("[DB] New connection opened")
+    return _local.conn
 
 
 # ── Result ─────────────────────────────────────────────────────
@@ -128,17 +151,25 @@ class QueryBuilder:
     # ── Execution ──────────────────────────────────────────────
 
     def execute(self) -> Result:
-        with psycopg.connect(_db_url(), row_factory=dict_row) as conn:
-            if self._action == "select":
-                return self._do_select(conn)
-            if self._action == "insert":
-                return self._do_insert(conn)
-            if self._action == "upsert":
-                return self._do_upsert(conn)
-            if self._action == "update":
-                return self._do_update(conn)
-            if self._action == "delete":
-                return self._do_delete(conn)
+        conn = _get_conn()
+        if self._action == "select":
+            return self._do_select(conn)
+        if self._action == "insert":
+            result = self._do_insert(conn)
+            conn.commit()
+            return result
+        if self._action == "upsert":
+            result = self._do_upsert(conn)
+            conn.commit()
+            return result
+        if self._action == "update":
+            result = self._do_update(conn)
+            conn.commit()
+            return result
+        if self._action == "delete":
+            result = self._do_delete(conn)
+            conn.commit()
+            return result
         raise RuntimeError(f"Unknown DB action: {self._action}")
 
     # ── Private SQL builders ───────────────────────────────────
@@ -208,7 +239,7 @@ class QueryBuilder:
             cur.execute(sql, vals)
             return Result(data=[_coerce(r) for r in cur.fetchall()])
 
-    def _do_upsert(self, conn: psycopg.Connection) -> Result:
+    def _do_upsert(self, conn: psycopg.Connection) -> Result:  # noqa
         rows: list[dict] = self._payload  # type: ignore
         if not rows:
             return Result(data=[])
