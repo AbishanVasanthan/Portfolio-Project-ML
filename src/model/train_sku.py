@@ -12,6 +12,12 @@ import os
 import warnings
 from datetime import datetime
 
+# Limit OpenBLAS / MKL threads to 1 — prevents OOM on memory-constrained
+# machines (C: drive full = no page file expansion room).
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+
 import mlflow
 import mlflow.xgboost
 import numpy as np
@@ -86,14 +92,23 @@ def train_sku_horizons(cfg: dict, retrain_id: int | None = None) -> dict:
     if df.empty:
         raise RuntimeError("[TRAIN_SKU] Empty feature panel — run --mode setup_skus first")
 
-    logger.info("[TRAIN_SKU] Panel: %d rows | %d depots | %d SKUs",
-                len(df), df["depot"].nunique(), df["sku_code"].nunique())
+    # Limit to last 3 years (156 weeks) per group to keep memory manageable
+    MAX_WEEKS = 156
+    df = (
+        df.sort_values(["depot", "sku_code", "week_start"])
+        .groupby(["depot", "sku_code"], group_keys=False)
+        .tail(MAX_WEEKS)
+        .reset_index(drop=True)
+    )
+
+    logger.info("[TRAIN_SKU] Panel (last %d wks): %d rows | %d depots | %d SKUs",
+                MAX_WEEKS, len(df), df["depot"].nunique(), df["sku_code"].nunique())
 
     cv_train = cfg["model"]["cv_train_weeks"]
     cv_val   = cfg["model"]["cv_val_weeks"]
     cv_step  = cfg["model"]["cv_step_weeks"]
     cv_min   = cfg["model"]["cv_min_folds"]
-    n_trials = cfg["model"]["optuna_trials"]
+    n_trials = min(cfg["model"]["optuna_trials"], 20)  # cap for SKU models
     xgb_cfg  = cfg["model"]["xgb"]
 
     unique_weeks = sorted(df["week_start"].unique())
