@@ -5,7 +5,7 @@ from typing import Optional
 
 import pandas as pd
 import yaml
-from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi import BackgroundTasks, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -39,6 +39,77 @@ async def startup():
         logger.info("[SERVE] Models loaded successfully")
     except Exception as e:
         logger.warning("[SERVE] Could not load models at startup (train first): %s", e)
+
+
+# ── GET /health ───────────────────────────────────────────────
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "models_loaded": _models_loaded}
+
+
+# ── POST /reload-models ───────────────────────────────────────
+
+@app.post("/reload-models")
+def reload_models(x_admin_key: Optional[str] = Header(None)):
+    expected = os.environ.get("ADMIN_API_KEY")
+    if expected and x_admin_key != expected:
+        raise HTTPException(status_code=401, detail="Invalid admin key")
+
+    global _models_loaded
+    from src.model.predict import load_models
+    try:
+        load_models(_cfg)
+        _models_loaded = True
+        logger.info("[SERVE] Models reloaded via /reload-models")
+        return {"status": "reloaded", "models_loaded": True}
+    except Exception as e:
+        _models_loaded = False
+        logger.error("[SERVE] Model reload failed: %s", e)
+        raise HTTPException(status_code=500, detail=f"Model reload failed: {e}")
+
+
+# ── POST /forecast/all ────────────────────────────────────────
+
+@app.post("/forecast/all")
+def forecast_all(background_tasks: BackgroundTasks, x_admin_key: Optional[str] = Header(None)):
+    """Generate and store 6-week forecasts for all 24 depots."""
+    expected = os.environ.get("ADMIN_API_KEY")
+    if expected and x_admin_key != expected:
+        raise HTTPException(status_code=401, detail="Invalid admin key")
+
+    if not _models_loaded:
+        raise HTTPException(status_code=503, detail="Models not loaded. Run `python pipeline.py --mode train` first.")
+
+    background_tasks.add_task(_run_forecast_all)
+    return {"status": "started", "message": "Generating forecasts for all depots in background"}
+
+
+def _run_forecast_all() -> None:
+    from src.model.predict import forecast_depot
+    sb = get_client()
+    today = date.today()
+
+    depot_result = sb.table("tc_depots").select("depot_id,name").order("name").execute()
+    for depot in depot_result.data:
+        depot_id = depot["depot_id"]
+        depot_name = depot["name"]
+        try:
+            recent = _get_recent_panel(depot_id, 52)
+            if recent.empty:
+                continue
+            forecasts = forecast_depot(depot_name, today, recent, _cfg)
+            for fc in forecasts:
+                sb.table("tc_forecasts").upsert({
+                    "depot_id": depot_id,
+                    "as_of_date": today.isoformat(),
+                    "horizon_weeks": fc["horizon"],
+                    "forecast_week": fc["forecast_week"].isoformat(),
+                    "demand_forecast": fc["demand_tonnes"],
+                }, on_conflict="depot_id,forecast_week").execute()
+            logger.info("[SERVE] forecast_all: %s — done", depot_name)
+        except Exception as e:
+            logger.warning("[SERVE] forecast_all: %s failed: %s", depot_name, e)
 
 
 # ── Helpers ───────────────────────────────────────────────────

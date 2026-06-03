@@ -2,10 +2,11 @@
 pipeline.py — Single entry point for the Tokyo Cement Demand Forecasting System.
 
 Usage:
-    python pipeline.py --mode setup    # First-time setup
-    python pipeline.py --mode update   # Fetch fresh weather/economic data
-    python pipeline.py --mode train    # Train (or retrain) the model
-    python pipeline.py --mode serve    # Start the FastAPI server
+    python pipeline.py --mode setup         # First-time setup
+    python pipeline.py --mode update        # Fetch fresh weather/economic data
+    python pipeline.py --mode train         # Train (or retrain) the model + push forecasts
+    python pipeline.py --mode forecast_all  # Push 6-week forecasts for all 24 depots to DB
+    python pipeline.py --mode serve         # Start the FastAPI server
 """
 
 import argparse
@@ -371,10 +372,13 @@ def run_train(cfg: dict) -> None:
 
     result = train_all_horizons(cfg, retrain_id=retrain_id)
 
-    # Step 3: Evaluate + save plots
+    # Step 3: Evaluate + save plots (non-fatal — requires tc_model_plots table)
     logger.info("[PIPELINE] Step 3/5 — Evaluate model and save plots")
-    from src.model.evaluate import run_evaluation
-    run_evaluation(result, df, retrain_id, cfg)
+    try:
+        from src.model.evaluate import run_evaluation
+        run_evaluation(result, df, retrain_id, cfg)
+    except Exception as e:
+        logger.warning("[PIPELINE] Evaluation skipped (non-fatal): %s", e)
 
     # Step 4: Write retrain_log
     logger.info("[PIPELINE] Step 4/5 — Update retrain_log")
@@ -401,6 +405,67 @@ def run_train(cfg: dict) -> None:
     )
     if mape_before:
         print(f"[TRAIN] Previous MAPE: {mape_before:.1f}%")
+
+    # Step 6: Push fresh forecasts for all depots to tc_forecasts
+    logger.info("[PIPELINE] Step 6/6 — Push 6-week forecasts for all depots to DB")
+    run_forecast_all(cfg)
+
+
+# ════════════════════════════════════════════════════════════
+# MODE: forecast_all
+# ════════════════════════════════════════════════════════════
+
+def run_forecast_all(cfg: dict) -> None:
+    """Generate a 6-week forecast for every depot and upsert into tc_forecasts."""
+    import pandas as pd
+    from datetime import date
+    from src.db.db import get_client
+    from src.model.predict import load_models, forecast_depot
+
+    logger.info("[PIPELINE] ══ MODE: forecast_all ══")
+    load_models(cfg)
+
+    sb = get_client()
+    depot_result = sb.table("tc_depots").select("depot_id,name").order("name").execute()
+    depots = depot_result.data
+    today = date.today()
+    total = 0
+
+    for depot in depots:
+        depot_id = depot["depot_id"]
+        depot_name = depot["name"]
+
+        panel_result = sb.table("tc_demand_panel").select("*").eq(
+            "depot_id", depot_id
+        ).order("week_start", desc=True).limit(52).execute()
+
+        df = pd.DataFrame(panel_result.data)
+        if df.empty:
+            logger.warning("[PIPELINE] forecast_all: no panel data for depot '%s', skipping", depot_name)
+            continue
+
+        df["depot"] = depot_name
+        df = df.sort_values("week_start").reset_index(drop=True)
+
+        try:
+            forecasts = forecast_depot(depot_name, today, df, cfg)
+        except Exception as e:
+            logger.warning("[PIPELINE] forecast_all: depot '%s' failed: %s", depot_name, e)
+            continue
+
+        for fc in forecasts:
+            sb.table("tc_forecasts").upsert({
+                "depot_id": depot_id,
+                "as_of_date": today.isoformat(),
+                "horizon_weeks": fc["horizon"],
+                "forecast_week": fc["forecast_week"].isoformat(),
+                "demand_forecast": fc["demand_tonnes"],
+            }, on_conflict="depot_id,forecast_week").execute()
+
+        total += 1
+        logger.info("[PIPELINE] forecast_all: %s — %d horizons stored", depot_name, len(forecasts))
+
+    logger.info("[PIPELINE] ✓ forecast_all complete: %d/%d depots", total, len(depots))
 
 
 # ════════════════════════════════════════════════════════════
@@ -452,13 +517,12 @@ def main():
     parser.add_argument(
         "--mode",
         required=True,
-        choices=["setup", "update", "train", "serve"],
+        choices=["setup", "update", "train", "forecast_all", "serve"],
         help="Pipeline mode to run",
     )
     args = parser.parse_args()
 
-    _require_env("SUPABASE_URL")
-    _require_env("SUPABASE_KEY")
+    _require_env("DATABASE_URL")
 
     cfg = load_config()
 
@@ -473,6 +537,7 @@ def main():
         "setup": run_setup,
         "update": run_update,
         "train": run_train,
+        "forecast_all": run_forecast_all,
         "serve": run_serve,
     }
 

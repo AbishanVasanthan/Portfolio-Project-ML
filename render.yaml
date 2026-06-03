@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: tokyo-cement-api
+    runtime: python
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python pipeline.py --mode serve"
+    healthCheckPath: /health
+    autoDeploy: true
+
+    envVars:
+      - key: SUPABASE_URL
+        sync: false          # set this manually in the Render dashboard
+      - key: SUPABASE_KEY
+        sync: false          # set this manually in the Render dashboard
+      - key: MLFLOW_TRACKING_URI
+        sync: false          # DagsHub URI: https://dagshub.com/<user>/<repo>.mlflow
+      - key: MLFLOW_TRACKING_USERNAME
+        sync: false          # DagsHub username
+      - key: MLFLOW_TRACKING_PASSWORD
+        sync: false          # DagsHub token
+      - key: ADMIN_API_KEY
+        sync: false          # secret for POST /reload-models (generate any random string)
+      - key: API_HOST
+        value: "0.0.0.0"
+      - key: API_PORT
+        value: "10000"       # Render routes external traffic to port 10000

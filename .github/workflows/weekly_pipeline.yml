@@ -1,0 +1,57 @@
+name: Weekly ML Pipeline
+
+on:
+  schedule:
+    # Every Sunday at 01:00 UTC (before the work week starts)
+    - cron: '0 1 * * 0'
+  workflow_dispatch:
+    # Allow manual trigger from the GitHub UI
+
+jobs:
+  weekly-pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # ── Step 1: Pull fresh weather + economic data into Supabase ──
+      - name: Update data
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: python pipeline.py --mode update
+
+      # ── Step 2: Retrain models + push all depot forecasts to DB ──
+      - name: Retrain and forecast
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+          MLFLOW_TRACKING_USERNAME: ${{ secrets.MLFLOW_TRACKING_USERNAME }}
+          MLFLOW_TRACKING_PASSWORD: ${{ secrets.MLFLOW_TRACKING_PASSWORD }}
+        run: python pipeline.py --mode train
+
+      # ── Step 3: Reload models on the live API server (optional) ──
+      # If RENDER_API_URL is set, signal the server to reload from MLflow.
+      # Skip this step if the secret is not configured.
+      - name: Reload models on Render server
+        if: ${{ secrets.RENDER_API_URL != '' }}
+        env:
+          RENDER_API_URL: ${{ secrets.RENDER_API_URL }}
+          ADMIN_API_KEY: ${{ secrets.ADMIN_API_KEY }}
+        run: |
+          curl -sf -X POST "${RENDER_API_URL}/reload-models" \
+            -H "X-Admin-Key: ${ADMIN_API_KEY}" \
+            -H "Content-Type: application/json" \
+            || echo "Model reload request sent (non-fatal if server is restarting)"
