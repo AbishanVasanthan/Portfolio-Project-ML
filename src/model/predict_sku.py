@@ -78,23 +78,30 @@ def _build_sku_feature_row(
     ]
     for col in carry_cols:
         try:
-            row[col] = float(shared_row[col]) if pd.notna(shared_row.get(col)) else np.nan
+            val = shared_row.get(col)
+            if val is None or (isinstance(val, float) and np.isnan(val)):
+                row[col] = 0.0
+            else:
+                row[col] = float(val)
         except (KeyError, TypeError):
-            row[col] = np.nan
+            row[col] = 0.0
 
     # Encodings
     row["depot_enc"] = depot_enc
     row["sku_enc"]   = sku_enc
     row["mix_ratio"] = mix_ratio
 
-    # Interaction features
-    precip  = row.get("precip_sum", 0) or 0
-    monsoon = row.get("is_sw_monsoon", 0) or 0
+    # Interaction features — use _safe to guard against NaN
+    def _safe(v):
+        return 0.0 if (v is None or (isinstance(v, float) and np.isnan(v))) else float(v)
+
+    precip  = _safe(row.get("precip_sum", 0))
+    monsoon = _safe(row.get("is_sw_monsoon", 0))
     row["precip_x_monsoon"]          = precip * monsoon
-    row["post_holiday_demand_boost"] = (row.get("post_holiday_lag_1", 0) or 0) * (row.get("demand_rolling_mean_4", 0) or 0)
+    row["post_holiday_demand_boost"] = _safe(row.get("post_holiday_lag_1", 0)) * _safe(row.get("demand_rolling_mean_4", 0))
     row["sku_x_sw_monsoon"]          = float(sku_enc) * monsoon
-    row["sku_x_ne_monsoon"]          = float(sku_enc) * (row.get("is_ne_monsoon", 0) or 0)
-    row["sku_x_dry_season"]          = float(sku_enc) * (row.get("is_dry_season", 0) or 0)
+    row["sku_x_ne_monsoon"]          = float(sku_enc) * _safe(row.get("is_ne_monsoon", 0))
+    row["sku_x_dry_season"]          = float(sku_enc) * _safe(row.get("is_dry_season", 0))
     row["sku_x_mix_ratio"]           = float(sku_enc) * mix_ratio
 
     row["quarter"] = ((int(row.get("month", 1)) - 1) // 3) + 1
