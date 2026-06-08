@@ -453,6 +453,12 @@ def run_forecast_all(cfg: dict) -> None:
             logger.warning("[PIPELINE] forecast_all: depot '%s' failed: %s", depot_name, e)
             continue
 
+        # Replace this depot's forecasts. Each run uses a new as_of_date, so the
+        # forecast_weeks shift forward and won't collide with the previous run's
+        # rows on the (depot_id, forecast_week) key — without this delete, stale
+        # forecasts from older runs accumulate. Replace, don't append.
+        sb.table("tc_forecasts").delete().eq("depot_id", depot_id).execute()
+
         for fc in forecasts:
             sb.table("tc_forecasts").upsert({
                 "depot_id": depot_id,
@@ -562,6 +568,10 @@ def run_forecast_sku_all(cfg: dict) -> None:
         except Exception as e:
             logger.warning("[PIPELINE] forecast_sku_all: depot '%s' failed: %s", depot_name, e)
             continue
+
+        # Replace this depot's SKU forecasts (same anti-accumulation reason as
+        # tc_forecasts above — shifting as_of_date means weeks never collide).
+        sb.table("tc_sku_forecasts").delete().eq("depot_id", depot_id).execute()
 
         for fc in forecasts:
             sb.table("tc_sku_forecasts").upsert({
